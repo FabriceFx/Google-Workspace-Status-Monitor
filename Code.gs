@@ -1,134 +1,218 @@
 /**
- * @fileoverview Script de surveillance du tableau de bord Google Workspace Status.
- * Détecte les nouveaux incidents via flux Atom et notifie par email.
- * @author Fabrice Faucheux
- * @version 1.0.0
+ * @fileoverview Moniteur d'incidents Google Workspace avec alertes par email.
+ * Ce script interroge le flux Atom officiel de Google Status, détecte les nouveaux
+ * incidents et envoie une notification formatée. Il inclut un moteur de 
+ * nettoyage HTML spécifique pour convertir les heures UTC du flux en heure locale
+ * et réparer les liens relatifs cassés.
+ *
+ * Fonctionnalités clés :
+ * - Parsing XML via XmlService (Atom Namespace).
+ * - Conversion intelligente des dates (Regex + Intl.DateTimeFormat).
+ * - Persistance des IDs traités via PropertiesService (anti-doublon).
+ * - Templating Email HTML responsive avec signature.
+ *
+ * @filename   Code.gs
+ * @version    6.2.1
+ * @date       14 décembre 2025
+ * @author     Fabrice Faucheux
+ * @license    MIT (https://opensource.org/licenses/MIT)
  */
 
-// --- CONSTANTES DE CONFIGURATION ---
-
+// --- CONFIGURATION ---
 const URL_FLUX = "https://www.google.com/appsstatus/dashboard/fr/feed.atom";
 const CLE_IDS_VUS = "STATUT_GOOGLE_IDS_VUS";
-const LIMITE_HISTORIQUE = 50; // Nombre max d'IDs à conserver pour éviter de saturer les propriétés
+const LIMITE_HISTORIQUE = 50;
+const URL_FALLBACK = "https://www.google.com/appsstatus/dashboard/";
+const LOCALE_LANGUE = "fr-FR";
 
 /**
- * Fonction principale : Vérifie le flux RSS et notifie en cas de nouvel incident.
- * À lier à un déclencheur temporel (Time-driven trigger).
+ * FONCTION PRINCIPALE
  */
 function verifierStatutGoogleWorkspace() {
   try {
-    // 1. Initialisation des services et récupération de l'historique
-    const serviceProprietes = PropertiesService.getScriptProperties();
-    const idsStockesJson = serviceProprietes.getProperty(CLE_IDS_VUS);
-    
-    // Utilisation d'un Set pour une complexité de recherche O(1)
-    const ensembleIdsVus = idsStockesJson ? new Set(JSON.parse(idsStockesJson)) : new Set();
-    
-    // 2. Récupération et parsing du flux XML
     const reponse = UrlFetchApp.fetch(URL_FLUX);
-    const documentXml = XmlService.parse(reponse.getContentText());
+    traiterFluxAtom(reponse.getContentText());
+  } catch (erreur) {
+    console.error(`[CRITIQUE] Impossible de récupérer le flux : ${erreur.message}`);
+  }
+}
+
+/**
+ * Traite le flux Atom et détecte les nouveaux incidents.
+ * @param {string} contenuXml - Le XML brut.
+ */
+function traiterFluxAtom(contenuXml) {
+  try {
+    const serviceProprietes = PropertiesService.getScriptProperties();
+    const idsStockes = JSON.parse(serviceProprietes.getProperty(CLE_IDS_VUS) || "[]");
+    const ensembleIdsVus = new Set(idsStockes);
+
+    const documentXml = XmlService.parse(contenuXml);
     const racine = documentXml.getRootElement();
     const nsAtom = XmlService.getNamespace("http://www.w3.org/2005/Atom");
     
-    // Conversion de la liste Java en tableau JS natif pour utiliser les méthodes modernes
-    const listeEntreesXml = racine.getChildren("entry", nsAtom);
+    const entrees = nsAtom ? racine.getChildren("entry", nsAtom) : racine.getChildren("entry");
     
-    let nouveauxIncidentsDetectes = false;
-    const nouveauxIds = [];
+    let nouveauxDetectes = false;
+    const fuseauScript = Session.getScriptTimeZone(); 
 
-    // 3. Traitement des entrées
-    // On inverse le tableau pour traiter du plus ancien au plus récent (ordre chronologique des emails)
-    const entreesArray = [...listeEntreesXml].reverse();
+    [...entrees].reverse().forEach(entree => {
+      const id = nsAtom ? entree.getChild("id", nsAtom).getText() : entree.getChild("id").getText();
 
-    entreesArray.forEach(entree => {
-      const idEntree = entree.getChild("id", nsAtom).getText();
-      
-      if (!ensembleIdsVus.has(idEntree)) {
-        console.info(`Nouvel incident détecté : ${idEntree}`);
-        nouveauxIncidentsDetectes = true;
+      if (!ensembleIdsVus.has(id)) {
+        console.info(`Traitement de l'incident : ${id}`);
+        nouveauxDetectes = true;
+
+        const titre = nsAtom ? entree.getChild("title", nsAtom).getText() : entree.getChild("title").getText();
+        const dateRaw = nsAtom ? entree.getChild("updated", nsAtom).getText() : entree.getChild("updated").getText();
         
-        // Extraction des données avec déstructuration simulée via variables
-        const detailsIncident = {
-          titre: entree.getChild("title", nsAtom).getText(),
-          lien: entree.getChild("link", nsAtom).getAttribute("href").getValue(),
-          resumeHtml: entree.getChild("summary", nsAtom).getText()
-        };
+        // Extraction de l'URL spécifique de l'incident (Crucial pour le lien anglais)
+        const lienPrincipal = extraireLienPrincipal(entree, nsAtom);
         
-        // Envoi de la notification
-        envoyerAlerteEmail(detailsIncident);
+        let resumeBrut = nsAtom ? entree.getChild("summary", nsAtom).getText() : entree.getChild("summary").getText();
+
+        // --- TRAITEMENT DU CONTENU HTML ---
         
-        // Mise à jour locale des listes
-        nouveauxIds.push(idEntree);
-        ensembleIdsVus.add(idEntree);
+        // 1. Réparation des liens relatifs en utilisant le lien de l'incident comme base
+        let resumeTraite = reparerLiensRelatifs(resumeBrut, lienPrincipal);
+
+        // 2. Conversion des dates UTC vers Locale
+        resumeTraite = convertirHeuresDansHtml(resumeTraite, fuseauScript);
+
+        // 3. Nettoyage du label UTC
+        resumeTraite = nettoyerLabelUtc(resumeTraite);
+
+        envoyerAlerteEmail({
+          titre: titre,
+          lien: lienPrincipal,
+          resumeHtml: resumeTraite,
+          dateBrute: dateRaw,
+          fuseau: fuseauScript
+        });
+
+        ensembleIdsVus.add(id);
       }
     });
 
-    // 4. Sauvegarde persistante (si nécessaire)
-    if (nouveauxIncidentsDetectes) {
-      mettreAJourHistorique(ensembleIdsVus, serviceProprietes);
-    } else {
-      console.info("R.A.S : Aucun nouvel incident sur le tableau de bord.");
+    if (nouveauxDetectes) {
+      const listeSauvegarde = Array.from(ensembleIdsVus).slice(-LIMITE_HISTORIQUE);
+      serviceProprietes.setProperty(CLE_IDS_VUS, JSON.stringify(listeSauvegarde));
     }
 
   } catch (erreur) {
-    console.error(`Erreur critique dans verifierStatutGoogleWorkspace : ${erreur.message}`);
-    // Optionnel : Notification d'erreur au développeur
+    console.error(`Erreur de parsing XML : ${erreur.stack}`);
   }
 }
 
-/**
- * Met à jour le stockage des propriétés en limitant la taille de l'historique.
- * @param {Set<string>} ensembleIdsVus - L'ensemble complet des IDs.
- * @param {PropertiesService.ScriptProperties} serviceProprietes - Le service de propriétés.
- */
-function mettreAJourHistorique(ensembleIdsVus, serviceProprietes) {
-  // Conversion Set -> Array
-  let tableauIds = Array.from(ensembleIdsVus);
-  
-  // Optimisation : On ne garde que les X derniers éléments pour économiser l'espace de stockage
-  if (tableauIds.length > LIMITE_HISTORIQUE) {
-    tableauIds = tableauIds.slice(-LIMITE_HISTORIQUE);
-  }
-  
-  serviceProprietes.setProperty(CLE_IDS_VUS, JSON.stringify(tableauIds));
-  console.info(`Historique mis à jour. ${tableauIds.length} IDs conservés.`);
+// --- MOTEUR DE TRANSFORMATION ---
+
+function nettoyerLabelUtc(html) {
+  if (!html) return "";
+  const regexSpanUtc = /<span[^>]*>\s*\(fuseau\s+horaire\s+<strong[^>]*>UTC<\/strong>\)\s*<\/span>/gi;
+  return html.replace(regexSpanUtc, "");
+}
+
+function convertirHeuresDansHtml(html, fuseauCible) {
+  if (!html) return "";
+  const regexDateIso = /<strong[^>]*>(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})<\/strong>/gi;
+
+  return html.replace(regexDateIso, (match, datePart, timePart) => {
+    try {
+      const [annee, mois, jour] = datePart.split('-').map(Number);
+      const [heure, minute] = timePart.split(':').map(Number);
+      const dateUtc = new Date(Date.UTC(annee, mois - 1, jour, heure, minute));
+
+      const dateLocale = new Intl.DateTimeFormat(LOCALE_LANGUE, {
+        day: 'numeric',
+        month: 'short',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: fuseauCible
+      }).format(dateUtc);
+
+      return `<strong>${dateLocale}</strong>`;
+    } catch (e) {
+      return match;
+    }
+  });
 }
 
 /**
- * Envoie une notification par email formattée en HTML.
- * @param {Object} details - Objet contenant les détails de l'incident.
- * @param {string} details.titre - Le titre de l'incident.
- * @param {string} details.lien - Le lien vers le dashboard.
- * @param {string} details.resumeHtml - Le résumé fourni par Google.
+ * CORRECTION APPLIQUÉE ICI
+ * Utilise 'urlDeReference' (l'incident) comme base, et non plus le fallback global.
  */
-function envoyerAlerteEmail({ titre, lien, resumeHtml }) {
+function reparerLiensRelatifs(htmlFragment, urlDeReference) {
+  if (!htmlFragment) return "";
+  // Si urlDeReference existe, on l'utilise comme préfixe pour le lien ?hl=en
+  const base = urlDeReference || URL_FALLBACK;
+  
+  return htmlFragment.replace(/href="\?(?!http)/g, `href="${base}?`);
+}
+
+function extraireLienPrincipal(elementEntree, ns) {
+  const liens = ns ? elementEntree.getChildren("link", ns) : elementEntree.getChildren("link");
+  const lienTrouve = liens.find(l => {
+    const rel = l.getAttribute("rel") ? l.getAttribute("rel").getValue() : "alternate";
+    return rel === "alternate";
+  });
+  return lienTrouve ? lienTrouve.getAttribute("href").getValue() : URL_FALLBACK;
+}
+
+function formaterDateEntete(dateIsoString, fuseau) {
+  if (!dateIsoString) return "Date inconnue";
+  try {
+    return new Intl.DateTimeFormat(LOCALE_LANGUE, {
+      dateStyle: 'full',
+      timeStyle: 'short',
+      timeZone: fuseau
+    }).format(new Date(dateIsoString));
+  } catch (e) {
+    return dateIsoString;
+  }
+}
+
+// --- ENVOI EMAIL ---
+
+function envoyerAlerteEmail({ titre, lien, resumeHtml, dateBrute, fuseau }) {
   const destinataire = Session.getActiveUser().getEmail();
-  const sujet = `🚨 Alerte Google Workspace : ${titre}`;
-  
-  // Utilisation des Template Literals pour le HTML
-  const corpsHtml = `
-    <div style="font-family: Arial, sans-serif; color: #333;">
-      <h2 style="color: #d93025;">Nouvel incident détecté</h2>
-      <h3 style="background-color: #f1f3f4; padding: 10px; border-radius: 4px;">${titre}</h3>
+  const dateAffichee = formaterDateEntete(dateBrute, fuseau);
+  const titrePropre = titre.replace(/\sUTC$/, "");
+
+  const htmlBody = `
+    <div style="font-family: 'Google Sans', Roboto, Arial, sans-serif; color: #202124; max-width: 600px; border: 1px solid #dadce0; border-radius: 8px; overflow:hidden;">
       
-      <div style="border-left: 4px solid #d93025; padding-left: 15px; margin: 15px 0;">
-        ${resumeHtml}
+      <div style="background-color: #d93025; color: white; padding: 18px 24px;">
+        <h2 style="margin:0; font-size: 18px; line-height: 24px;">Alerte Google Workspace</h2>
       </div>
       
-      <p style="margin-top: 20px;">
-        <a href="${lien}" style="background-color: #1a73e8; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px;">
-          Voir le tableau de bord
-        </a>
-      </p>
-      <p style="font-size: 12px; color: #666; margin-top: 30px;">
-        Généré par le script de surveillance automatique.
-      </p>
+      <div style="padding: 24px;">
+        <h3 style="margin: 0 0 16px 0; font-size: 20px; font-weight: 400;">${titrePropre}</h3>
+        
+        <div style="display: flex; align-items: center; margin-bottom: 24px; color: #5f6368; font-size: 14px;">
+          <span style="margin-right: 8px;">🕒</span>
+          <strong>Signalé le :</strong>&nbsp;${dateAffichee}
+        </div>
+        
+        <div style="background-color: #f8f9fa; padding: 16px; border-radius: 4px; border: 1px solid #e8eaed; line-height: 1.6;">
+          ${resumeHtml}
+        </div>
+
+        <div style="margin-top: 24px; text-align: center;">
+          <a href="${lien}" style="background-color: #1a73e8; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; font-weight: 500; font-size: 14px;">
+            Voir le statut en direct
+          </a>
+        </div>
+      </div>
+
+      <div style="background-color: #f1f3f4; padding: 15px; text-align: center; font-size: 11px; color: #5f6368; border-top: 1px solid #e0e0e0;">
+        Automatisé avec <strong>Google Apps Script</strong> &bull; Développement par <strong>Fabrice Faucheux</strong>
+      </div>
     </div>
   `;
   
   MailApp.sendEmail({
     to: destinataire,
-    subject: sujet,
-    htmlBody: corpsHtml
+    subject: `⚠️ ${titrePropre}`,
+    htmlBody: htmlBody
   });
 }
