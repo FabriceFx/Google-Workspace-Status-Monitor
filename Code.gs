@@ -12,7 +12,6 @@
  * - Templating Email HTML responsive avec signature.
  *
  * @filename   Code.gs
- * @version    6.2.1
  * @date       14 décembre 2025
  * @author     Fabrice Faucheux
  * @license    MIT (https://opensource.org/licenses/MIT)
@@ -41,47 +40,63 @@ function verifierStatutGoogleWorkspace() {
  * Traite le flux Atom et détecte les nouveaux incidents.
  * @param {string} contenuXml - Le XML brut.
  */
+/**
+ * Traite le flux Atom et détecte les nouveaux incidents avec gestion d'erreurs critique.
+ * @param {string} contenuXml - Le XML brut du flux Google Status.
+ */
 function traiterFluxAtom(contenuXml) {
+  // 1. Initialisation du verrou pour éviter les collisions (conflits d'accès)
+  const verrou = LockService.getScriptLock();
+  
   try {
-    const serviceProprietes = PropertiesService.getScriptProperties();
-    const idsStockes = JSON.parse(serviceProprietes.getProperty(CLE_IDS_VUS) || "[]");
-    const ensembleIdsVus = new Set(idsStockes);
+    // On attend jusqu'à 30 secondes que le verrou se libère
+    verrou.waitLock(30000); 
 
+    const serviceProprietes = PropertiesService.getScriptProperties();
+    let idsStockes = [];
+    
+    // 2. Lecture sécurisée des propriétés
+    try {
+      const brute = serviceProprietes.getProperty(CLE_IDS_VUS);
+      idsStockes = brute ? JSON.parse(brute) : [];
+    } catch (e) {
+      console.warn("Erreur de stockage (INTERNAL) : Réinitialisation de l'historique.");
+      idsStockes = []; // On repart à zéro si le stockage est illisible
+    }
+
+    const ensembleIdsVus = new Set(idsStockes);
     const documentXml = XmlService.parse(contenuXml);
     const racine = documentXml.getRootElement();
     const nsAtom = XmlService.getNamespace("http://www.w3.org/2005/Atom");
     
+    // Récupération des entrées (gestion du namespace Atom)
     const entrees = nsAtom ? racine.getChildren("entry", nsAtom) : racine.getChildren("entry");
     
     let nouveauxDetectes = false;
     const fuseauScript = Session.getScriptTimeZone(); 
 
+    // On inverse pour traiter du plus ancien au plus récent
     [...entrees].reverse().forEach(entree => {
-      const id = nsAtom ? entree.getChild("id", nsAtom).getText() : entree.getChild("id").getText();
+      const idElement = nsAtom ? entree.getChild("id", nsAtom) : entree.getChild("id");
+      if (!idElement) return; // Sécurité si l'entrée est malformée
+      
+      const id = idElement.getText();
 
       if (!ensembleIdsVus.has(id)) {
-        console.info(`Traitement de l'incident : ${id}`);
+        console.info(`Nouveau signalement détecté : ${id}`);
         nouveauxDetectes = true;
 
-        const titre = nsAtom ? entree.getChild("title", nsAtom).getText() : entree.getChild("title").getText();
-        const dateRaw = nsAtom ? entree.getChild("updated", nsAtom).getText() : entree.getChild("updated").getText();
-        
-        // Extraction de l'URL spécifique de l'incident (Crucial pour le lien anglais)
+        const titre = (nsAtom ? entree.getChild("title", nsAtom) : entree.getChild("title")).getText();
+        const dateRaw = (nsAtom ? entree.getChild("updated", nsAtom) : entree.getChild("updated")).getText();
         const lienPrincipal = extraireLienPrincipal(entree, nsAtom);
-        
-        let resumeBrut = nsAtom ? entree.getChild("summary", nsAtom).getText() : entree.getChild("summary").getText();
+        const resumeBrut = (nsAtom ? entree.getChild("summary", nsAtom) : entree.getChild("summary")).getText();
 
-        // --- TRAITEMENT DU CONTENU HTML ---
-        
-        // 1. Réparation des liens relatifs en utilisant le lien de l'incident comme base
+        // --- MOTEUR DE TRANSFORMATION ---
         let resumeTraite = reparerLiensRelatifs(resumeBrut, lienPrincipal);
-
-        // 2. Conversion des dates UTC vers Locale
         resumeTraite = convertirHeuresDansHtml(resumeTraite, fuseauScript);
-
-        // 3. Nettoyage du label UTC
         resumeTraite = nettoyerLabelUtc(resumeTraite);
 
+        // --- ENVOI DE L'ALERTE ---
         envoyerAlerteEmail({
           titre: titre,
           lien: lienPrincipal,
@@ -94,16 +109,23 @@ function traiterFluxAtom(contenuXml) {
       }
     });
 
+    // 3. Sauvegarde sécurisée si des changements ont eu lieu
     if (nouveauxDetectes) {
       const listeSauvegarde = Array.from(ensembleIdsVus).slice(-LIMITE_HISTORIQUE);
-      serviceProprietes.setProperty(CLE_IDS_VUS, JSON.stringify(listeSauvegarde));
+      try {
+        serviceProprietes.setProperty(CLE_IDS_VUS, JSON.stringify(listeSauvegarde));
+      } catch (e) {
+        console.error("Échec de l'écriture dans les propriétés : " + e.message);
+      }
     }
 
   } catch (erreur) {
-    console.error(`Erreur de parsing XML : ${erreur.stack}`);
+    console.error(`Erreur critique durant le traitement : ${erreur.stack}`);
+  } finally {
+    // 4. Libération systématique du verrou
+    verrou.releaseLock();
   }
 }
-
 // --- MOTEUR DE TRANSFORMATION ---
 
 function nettoyerLabelUtc(html) {
